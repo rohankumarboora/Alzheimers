@@ -1,6 +1,5 @@
-# app.py
+# app.py (no upload option)
 # Streamlit Dashboard: Alzheimer’s (OASIS Longitudinal) – EDA, Training, and Single-Case Prediction
-# Run: streamlit run app.py
 
 import os
 import numpy as np
@@ -23,13 +22,13 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 
 st.set_page_config(page_title="Alzheimer’s ML Dashboard", layout="wide", page_icon="🧠")
 
-# ---------------------- Utilities ----------------------
-DEFAULT_PATH = "oasis_longitudinal_10k.csv"  # fallback to your expanded CSV
+# ---------------------- Config ----------------------
+DEFAULT_PATH = "/mnt/data/oasis_longitudinal_10k.csv"  # fixed data source
 
 PRIORITY_LABELS = ["group", "target", "label", "class", "diagnosis", "dx", "status", "outcome", "cdr", "dementia", "y"]
-
 ID_LIKE_HINTS = ["id", "subject", "mri", "visit"]
 
+# ---------------------- Utilities ----------------------
 def pick_label_column(df: pd.DataFrame) -> str:
     cols = list(df.columns)
     lowermap = {c: c.lower() for c in cols}
@@ -62,15 +61,14 @@ def suggest_drop_cols(df: pd.DataFrame) -> List[str]:
     return sorted(list(set(drops)))
 
 @st.cache_data(show_spinner=False)
-def load_data(uploaded_file) -> pd.DataFrame:
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-    else:
-        if os.path.exists(DEFAULT_PATH):
-            df = pd.read_csv(DEFAULT_PATH)
-        else:
-            st.stop()
-    return df
+def load_data() -> pd.DataFrame:
+    if not os.path.exists(DEFAULT_PATH):
+        st.error(
+            f"Data file not found at `{DEFAULT_PATH}`.\n\n"
+            "Please place your dataset there (CSV) or change DEFAULT_PATH in the code."
+        )
+        st.stop()
+    return pd.read_csv(DEFAULT_PATH)
 
 def split_features_target(
     df: pd.DataFrame,
@@ -117,17 +115,14 @@ def make_pipeline(num_cols: List[str], cat_cols: List[str], model_name: str, par
     return pipe
 
 def safe_roc_auc(model, X_val, y_val):
-    # Works for binary or multi-class
     try:
         if hasattr(model, "predict_proba"):
             proba = model.predict_proba(X_val)
-            # If multiclass, use 'ovr' macro average
             if proba.shape[1] > 2:
                 return roc_auc_score(y_val, proba, multi_class="ovr")
             else:
                 return roc_auc_score(y_val, proba[:, 1])
-        else:
-            return np.nan
+        return np.nan
     except Exception:
         return np.nan
 
@@ -151,28 +146,21 @@ def train_model(X, y, model_name, params, test_size, random_state):
     return pipe, metrics, cm, labels, (X_train, X_val, y_train, y_val)
 
 def auto_build_single_input(df: pd.DataFrame, X_cols: List[str]) -> Dict[str, any]:
-    """
-    Build UI inputs for a single-case form using training column types & ranges.
-    Returns a dict {colname: value}
-    """
     st.subheader("Enter values")
     values = {}
     for c in X_cols:
         series = df[c]
         if series.dtype == "object" or str(series.dtype) == "category" or series.dtype == "bool":
             opts = sorted([o for o in series.dropna().unique().tolist()])
-            default = opts[0] if opts else ""
             values[c] = st.selectbox(c, options=opts if len(opts) > 0 else [""])
         else:
-            s = pd.to_numeric(series, errors="coerce")
-            s = s.dropna()
+            s = pd.to_numeric(series, errors="coerce").dropna()
             if len(s) == 0:
                 values[c] = st.number_input(c, value=0.0)
             else:
                 mn, mx = float(s.min()), float(s.max())
                 mean_val = float(s.mean())
                 step = (mx - mn) / 100 if mx > mn else 1.0
-                # guard wide ranges
                 if np.isfinite(mn) and np.isfinite(mx):
                     values[c] = st.number_input(c, value=mean_val, min_value=mn, max_value=mx, step=step)
                 else:
@@ -181,15 +169,19 @@ def auto_build_single_input(df: pd.DataFrame, X_cols: List[str]) -> Dict[str, an
 
 # ---------------------- Sidebar / Navigation ----------------------
 st.sidebar.title("🧠 Alzheimer’s ML Dashboard")
-uploaded = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
-df = load_data(uploaded)
+df = load_data()  # no uploader, fixed path only
 
-st.sidebar.markdown("---")
+st.sidebar.markdown(f"**Data path:** `{DEFAULT_PATH}`")
+
 auto_label = pick_label_column(df)
-label_col = st.sidebar.selectbox("Target column", options=list(df.columns), index=list(df.columns).index(auto_label) if auto_label in df.columns else 0)
+label_col = st.sidebar.selectbox("Target column", options=list(df.columns),
+                                 index=list(df.columns).index(auto_label) if auto_label in df.columns else 0)
 st.sidebar.caption(f"Auto-detected: **{auto_label}**")
+
 drop_suggest = suggest_drop_cols(df)
-drop_cols = st.sidebar.multiselect("Columns to drop (IDs, nearly-unique)", options=list(df.columns), default=[c for c in drop_suggest if c != label_col])
+drop_cols = st.sidebar.multiselect("Columns to drop (IDs, nearly-unique)",
+                                   options=list(df.columns),
+                                   default=[c for c in drop_suggest if c != label_col])
 
 st.sidebar.markdown("---")
 page = st.sidebar.radio("Navigate", ["Overview", "Explore (EDA)", "Train & Evaluate", "Single-Case Prediction"])
@@ -251,7 +243,6 @@ elif page == "Explore (EDA)":
                 .properties(height=350)
             )
             st.altair_chart(chart, use_container_width=True)
-            # Stacked vs target
             st.markdown("#### Cross by Target")
             cross = pd.crosstab(X[col].astype(str), y)
             st.dataframe(cross, use_container_width=True)
@@ -330,7 +321,6 @@ elif page == "Train & Evaluate":
         st.markdown("#### Classification Report")
         st.code(metrics["report"])
 
-        # ROC curve (only if binary or we can show OvR curves)
         from sklearn.preprocessing import label_binarize
         X_train, X_val, y_train, y_val = splits
         if hasattr(model, "predict_proba"):
@@ -348,14 +338,12 @@ elif page == "Train & Evaluate":
             except Exception:
                 st.info("Could not render ROC curves for this configuration.")
 
-        # Store model in session for prediction page
         st.session_state["trained_model"] = model
         st.session_state["feature_columns"] = list(X.columns)
         st.session_state["train_df"] = pd.concat([X, y.rename(label_col)], axis=1)
 
 elif page == "Single-Case Prediction":
     st.title("Single-Case Prediction")
-    # Require a trained model
     if "trained_model" not in st.session_state or "feature_columns" not in st.session_state:
         st.warning("Please train a model first on the **Train & Evaluate** page.")
     else:
