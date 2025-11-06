@@ -23,7 +23,7 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 st.set_page_config(page_title="Alzheimer’s ML Dashboard", layout="wide", page_icon="🧠")
 
 # ---------------------- Config ----------------------
-DEFAULT_PATH = "/mnt/data/oasis_longitudinal_10k.csv"  # fixed data source
+DEFAULT_PATH = "oasis_longitudinal_10k.csv"  # fixed data source
 
 PRIORITY_LABELS = ["group", "target", "label", "class", "diagnosis", "dx", "status", "outcome", "cdr", "dementia", "y"]
 ID_LIKE_HINTS = ["id", "subject", "mri", "visit"]
