@@ -24,7 +24,7 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 st.set_page_config(page_title="OASIS – Alzheimer’s ML Dashboard", layout="wide", page_icon="🧠")
 
 # ---------------------- Config ----------------------
-DEFAULT_PATH = "/mnt/data/oasis_longitudinal.csv"  # fixed OASIS dataset path
+DEFAULT_PATH = "oasis_longitudinal.csv"  # fixed OASIS dataset path
 PRIORITY_LABELS = ["group"]  # prefer 'Group'
 ID_LIKE_HINTS = ["subject id", "mri id"]  # typical OASIS ID-ish columns
 
