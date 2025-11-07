@@ -1,4 +1,4 @@
-# app.py — OASIS Longitudinal (NaN-safe, no upload)
+# app.py — OASIS Longitudinal (NaN-safe, no upload, ranges & validation, Converted->Demented)
 # Streamlit Dashboard: EDA, Training, Single-Case Prediction
 
 import os
@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import altair as alt
 import streamlit as st
 
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Any
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -24,7 +24,7 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 st.set_page_config(page_title="OASIS – Alzheimer’s ML Dashboard", layout="wide", page_icon="🧠")
 
 # ---------------------- Config ----------------------
-DEFAULT_PATH = "oasis_longitudinal.csv"  # fixed OASIS dataset path
+DEFAULT_PATH = "/mnt/data/oasis_longitudinal.csv"  # fixed OASIS dataset path
 PRIORITY_LABELS = ["group"]  # prefer 'Group'
 ID_LIKE_HINTS = ["subject id", "mri id"]  # typical OASIS ID-ish columns
 
@@ -111,7 +111,7 @@ def make_pipeline(num_cols: List[str], cat_cols: List[str], model_name: str, par
         )
     elif model_name == "Gradient Boosting":
         clf = GradientBoostingClassifier(
-            n_estimators=params.get("n_estimators", 300),
+            n_estimators=params.get("n_estimitors", 300) if "n_estimators" not in params else params["n_estimators"],
             learning_rate=params.get("learning_rate", 0.05),
             max_depth=params.get("max_depth", 3),
             random_state=42
@@ -155,27 +155,64 @@ def train_model(X, y, model_name, params, test_size, random_state):
     labels = list(np.unique(y))
     return pipe, metrics, cm, labels, (X_train, X_val, y_train, y_val)
 
-def auto_build_single_input(df: pd.DataFrame, X_cols: List[str]) -> Dict[str, any]:
+def _fmt_num(v: float) -> str:
+    if not np.isfinite(v):
+        return "NA"
+    if abs(v) >= 1000 or (0 < abs(v) < 0.01):
+        return f"{v:.3e}"
+    return f"{v:.4g}"
+
+def auto_build_single_input(
+    df: pd.DataFrame,
+    X_cols: List[str]
+) -> Tuple[Dict[str, Any], Dict[str, Tuple[float, float]], List[str]]:
+    """
+    Build UI inputs for a single-case form using training column types & ranges.
+    - Numeric: free-form number input (no hard min/max), label shows [range: min — max]
+    - Categorical: dropdown with seen categories
+    Returns (values_dict, range_stats, numeric_cols_list)
+      - values_dict: {col: value}
+      - range_stats: {num_col: (min, max)}
+      - numeric_cols_list: list of numeric column names
+    """
     st.subheader("Enter values")
-    values = {}
+    values: Dict[str, Any] = {}
+    range_stats: Dict[str, Tuple[float, float]] = {}
+    numeric_cols_list: List[str] = []
+
     for c in X_cols:
         series = df[c]
+
+        # CATEGORICAL -> dropdown
         if series.dtype == "object" or str(series.dtype) == "category" or series.dtype == "bool":
             opts = sorted([o for o in series.dropna().unique().tolist()])
-            values[c] = st.selectbox(c, options=opts if len(opts) > 0 else [""])
-        else:
-            s = pd.to_numeric(series, errors="coerce").dropna()
-            if len(s) == 0:
-                values[c] = st.number_input(c, value=0.0)
-            else:
-                mn, mx = float(s.min()), float(s.max())
-                mean_val = float(s.mean())
-                step = (mx - mn) / 100 if mx > mn else 1.0
-                if np.isfinite(mn) and np.isfinite(mx):
-                    values[c] = st.number_input(c, value=mean_val, min_value=mn, max_value=mx, step=step)
-                else:
-                    values[c] = st.number_input(c, value=mean_val if np.isfinite(mean_val) else 0.0)
-    return values
+            label = f"{c} (choices: {len(opts)})" if len(opts) > 0 else f"{c}"
+            values[c] = st.selectbox(label, options=opts if len(opts) > 0 else [""])
+            continue
+
+        # NUMERIC -> free number input + range hint in label
+        s = pd.to_numeric(series, errors="coerce").dropna()
+        if len(s) == 0:
+            values[c] = st.number_input(c, value=0.0, help="No numeric stats available for this field.")
+            continue
+
+        mn, mx = float(s.min()), float(s.max())
+        range_stats[c] = (mn, mx)
+        numeric_cols_list.append(c)
+
+        label = f"{c} [range: {_fmt_num(mn)} — {_fmt_num(mx)}]"
+        step = (mx - mn) / 100 if mx > mn else 1.0
+        mean_val = float(s.mean())
+        default_val = mean_val if np.isfinite(mean_val) else (mn if np.isfinite(mn) else 0.0)
+
+        values[c] = st.number_input(
+            label,
+            value=float(default_val),
+            step=float(step) if np.isfinite(step) and step > 0 else 1.0,
+            help="Suggested range shown; you can enter any value."
+        )
+
+    return values, range_stats, numeric_cols_list
 
 # ---------------------- Sidebar / Navigation ----------------------
 st.sidebar.title("🧠 OASIS – Alzheimer’s ML Dashboard")
@@ -183,6 +220,11 @@ st.sidebar.markdown(f"**Data path:** `{DEFAULT_PATH}`")
 
 # Load raw df and select label first
 raw_df = load_data()
+
+# ----- Requested rule: Convert 'Converted' -> 'Demented' in Group -----
+if "Group" in raw_df.columns:
+    raw_df["Group"] = raw_df["Group"].replace({"Converted": "Demented"})
+
 auto_label = pick_label_column(raw_df)
 label_col = st.sidebar.selectbox(
     "Target column",
@@ -394,11 +436,30 @@ elif page == "Single-Case Prediction":
         feat_cols = st.session_state["feature_columns"]
         train_df = st.session_state.get("train_df", pd.concat([X, y.rename(label_col)], axis=1))
 
+        # Build inputs (shows ranges for numeric, free typing)
         with st.form("single_case"):
-            inputs = auto_build_single_input(train_df, feat_cols)
+            inputs, range_stats, numeric_cols = auto_build_single_input(train_df, feat_cols)
             predict_btn = st.form_submit_button("Predict")
+
         if predict_btn:
+            # Assemble row for prediction
             x_row = pd.DataFrame([inputs])[feat_cols]
+
+            # Gentle validation: flag out-of-range numeric inputs
+            warnings = []
+            for c in numeric_cols:
+                val = x_row.loc[0, c]
+                if pd.isna(val) or c not in range_stats:
+                    continue
+                mn, mx = range_stats[c]
+                # only check if finite
+                if np.isfinite(val) and np.isfinite(mn) and np.isfinite(mx):
+                    if val < mn or val > mx:
+                        warnings.append(f"- **{c}** = {_fmt_num(val)} is outside training range [{_fmt_num(mn)}, {_fmt_num(mx)}].")
+            if warnings:
+                st.warning("Some inputs are outside the training range:\n" + "\n".join(warnings))
+
+            # Predict
             pred = model.predict(x_row)[0]
             st.success(f"**Predicted class:** {pred}")
             if hasattr(model, "predict_proba"):
