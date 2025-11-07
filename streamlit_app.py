@@ -1,5 +1,5 @@
-# app.py (OASIS Longitudinal specific)
-# Streamlit Dashboard: OASIS – EDA, Training, and Single-Case Prediction
+# app.py — OASIS Longitudinal (NaN-safe, no upload)
+# Streamlit Dashboard: EDA, Training, Single-Case Prediction
 
 import os
 import numpy as np
@@ -24,26 +24,21 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 st.set_page_config(page_title="OASIS – Alzheimer’s ML Dashboard", layout="wide", page_icon="🧠")
 
 # ---------------------- Config ----------------------
-DEFAULT_PATH = "/mnt/data/oasis_longitudinal.csv"  # fixed OASIS dataset
-
-# For OASIS, typical columns include:
-# 'Subject ID','MRI ID','Group','Visit','MR Delay','M/F','Hand','Age','Educ','SES',
-# 'MMSE','CDR','eTIV','nWBV','ASF'
-PRIORITY_LABELS = ["group"]  # lock to Group if available
-ID_LIKE_HINTS = ["subject id", "mri id"]  # default drops for OASIS
+DEFAULT_PATH = "/mnt/data/oasis_longitudinal.csv"  # fixed OASIS dataset path
+PRIORITY_LABELS = ["group"]  # prefer 'Group'
+ID_LIKE_HINTS = ["subject id", "mri id"]  # typical OASIS ID-ish columns
 
 # ---------------------- Utilities ----------------------
 def pick_label_column(df: pd.DataFrame) -> str:
-    # Prefer 'Group' if present and has >1 class
+    # Prefer 'Group' if present and sensible
     if "Group" in df.columns and df["Group"].nunique(dropna=True) > 1:
         return "Group"
-    # Otherwise fall back heuristics
+    # Otherwise use heuristics
     cols = list(df.columns)
     lowermap = {c: c.lower() for c in cols}
     for c in cols:
         if lowermap[c] in PRIORITY_LABELS and df[c].nunique(dropna=True) > 1:
             return c
-    # Low-cardinality fallback
     candidates = []
     for c in cols:
         nunq = df[c].nunique(dropna=True)
@@ -57,15 +52,14 @@ def pick_label_column(df: pd.DataFrame) -> str:
 def suggest_drop_cols(df: pd.DataFrame) -> List[str]:
     drops = []
     for c in df.columns:
-        lc = c.lower()
-        if lc in ID_LIKE_HINTS:
+        if c.lower() in ID_LIKE_HINTS:
             drops.append(c)
-    # Also drop columns that are nearly-unique identifiers
+    # Nearly-unique identifiers
     n = len(df)
     for c in df.columns:
         if df[c].nunique(dropna=True) > 0.9 * n and c not in drops and c != "Group":
             drops.append(c)
-    # Keep 'Visit' (useful), so remove if accidentally added
+    # Keep 'Visit' if present
     drops = [d for d in drops if d.lower() != "visit"]
     return sorted(list(set(drops)))
 
@@ -78,8 +72,6 @@ def load_data() -> pd.DataFrame:
         )
         st.stop()
     df = pd.read_csv(DEFAULT_PATH)
-    # Ensure expected OASIS columns are properly typed (optional soft coerce)
-    # (No hard renames here to be safe.)
     return df
 
 def split_features_target(df: pd.DataFrame, target_col: str, drop_cols: List[str]) -> Tuple[pd.DataFrame, pd.Series]:
@@ -143,6 +135,9 @@ def safe_roc_auc(model, X_val, y_val):
 
 @st.cache_resource(show_spinner=False)
 def train_model(X, y, model_name, params, test_size, random_state):
+    # Guard: stratify needs >=2 classes
+    if pd.Series(y).nunique(dropna=True) < 2:
+        raise ValueError("Target has fewer than 2 classes after cleaning. Please adjust target or filters.")
     X_train, X_val, y_train, y_val = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
@@ -184,29 +179,51 @@ def auto_build_single_input(df: pd.DataFrame, X_cols: List[str]) -> Dict[str, an
 
 # ---------------------- Sidebar / Navigation ----------------------
 st.sidebar.title("🧠 OASIS – Alzheimer’s ML Dashboard")
-df = load_data()  # fixed path only
-
 st.sidebar.markdown(f"**Data path:** `{DEFAULT_PATH}`")
 
-# Lock to Group if present; allow override
-auto_label = pick_label_column(df)
-label_col = st.sidebar.selectbox("Target column", options=list(df.columns),
-                                 index=list(df.columns).index(auto_label) if auto_label in df.columns else 0)
+# Load raw df and select label first
+raw_df = load_data()
+auto_label = pick_label_column(raw_df)
+label_col = st.sidebar.selectbox(
+    "Target column",
+    options=list(raw_df.columns),
+    index=list(raw_df.columns).index(auto_label) if auto_label in raw_df.columns else 0
+)
 st.sidebar.caption(f"Auto-detected: **{auto_label}**")
 
-# Default OASIS drops: Subject ID, MRI ID (if present)
+# ---- Clean missing values AFTER selecting target ----
+df = raw_df.replace([np.inf, -np.inf], np.nan)
+
+if label_col not in df.columns:
+    st.error("Selected target column not in dataframe.")
+    st.stop()
+
+missing_target_rows = df[label_col].isna().sum()
+if missing_target_rows > 0:
+    st.warning(f"Dropping {missing_target_rows} rows with missing target `{label_col}`.")
+    df = df.dropna(subset=[label_col]).reset_index(drop=True)
+
+# Drop all-empty feature cols (entirely NaN)
+empty_feature_cols = [c for c in df.columns if c != label_col and df[c].isna().all()]
+if empty_feature_cols:
+    st.info(f"Dropping all-empty columns: {', '.join(empty_feature_cols)}")
+    df = df.drop(columns=empty_feature_cols)
+
+# Now compute drop suggestions on the cleaned df
 default_drops = [c for c in ["Subject ID", "MRI ID"] if c in df.columns]
 drop_suggest = sorted(list(set(default_drops + suggest_drop_cols(df))))
-drop_cols = st.sidebar.multiselect("Columns to drop (IDs, nearly-unique)",
-                                   options=list(df.columns),
-                                   default=[c for c in drop_suggest if c != label_col])
+drop_cols = st.sidebar.multiselect(
+    "Columns to drop (IDs, nearly-unique)",
+    options=list(df.columns),
+    default=[c for c in drop_suggest if c != label_col]
+)
 
 st.sidebar.markdown("---")
 page = st.sidebar.radio("Navigate", ["Overview", "Explore (EDA)", "Train & Evaluate", "Single-Case Prediction"])
 
 # Derive X/y
 if label_col not in df.columns:
-    st.error("Selected target column not in dataframe.")
+    st.error("Selected target column not in dataframe after cleaning.")
     st.stop()
 X, y = split_features_target(df, label_col, drop_cols)
 
@@ -248,36 +265,39 @@ elif page == "Explore (EDA)":
     st.title("Explore (EDA)")
     st.markdown("Select columns to visualize distributions and relationships.")
 
-    col = st.selectbox("Choose a column", options=list(X.columns))
-    if col:
-        if X[col].dtype == "object" or str(X[col].dtype) == "category" or X[col].dtype == "bool":
-            st.markdown(f"#### Categorical: {col}")
-            vc = X[col].value_counts(dropna=False)
-            cat_df = pd.DataFrame({col: vc.index.astype(str), "count": vc.values})
-            chart = (
-                alt.Chart(cat_df)
-                .mark_bar()
-                .encode(x=alt.X(f"{col}:N", sort="-y"), y="count:Q", tooltip=[col, "count"])
-                .properties(height=350)
-            )
-            st.altair_chart(chart, use_container_width=True)
-            st.markdown("#### Cross by Target")
-            cross = pd.crosstab(X[col].astype(str), y)
-            st.dataframe(cross, use_container_width=True)
-        else:
-            st.markdown(f"#### Numeric: {col}")
-            c1, c2 = st.columns(2)
-            with c1:
-                hist = alt.Chart(pd.DataFrame({col: X[col]})).mark_bar().encode(
-                    alt.X(f"{col}:Q", bin=alt.Bin(maxbins=30)),
-                    y="count()"
-                ).properties(height=350)
-                st.altair_chart(hist, use_container_width=True)
-            with c2:
-                box = alt.Chart(pd.DataFrame({col: X[col], "target": y})).mark_boxplot().encode(
-                    x="target:N", y=f"{col}:Q"
-                ).properties(height=350)
-                st.altair_chart(box, use_container_width=True)
+    if len(X.columns) == 0:
+        st.error("No feature columns available after drops. Please adjust drop list.")
+    else:
+        col = st.selectbox("Choose a column", options=list(X.columns))
+        if col:
+            if X[col].dtype == "object" or str(X[col].dtype) == "category" or X[col].dtype == "bool":
+                st.markdown(f"#### Categorical: {col}")
+                vc = X[col].value_counts(dropna=False)
+                cat_df = pd.DataFrame({col: vc.index.astype(str), "count": vc.values})
+                chart = (
+                    alt.Chart(cat_df)
+                    .mark_bar()
+                    .encode(x=alt.X(f"{col}:N", sort="-y"), y="count:Q", tooltip=[col, "count"])
+                    .properties(height=350)
+                )
+                st.altair_chart(chart, use_container_width=True)
+                st.markdown("#### Cross by Target")
+                cross = pd.crosstab(X[col].astype(str), y)
+                st.dataframe(cross, use_container_width=True)
+            else:
+                st.markdown(f"#### Numeric: {col}")
+                c1, c2 = st.columns(2)
+                with c1:
+                    hist = alt.Chart(pd.DataFrame({col: X[col]})).mark_bar().encode(
+                        alt.X(f"{col}:Q", bin=alt.Bin(maxbins=30)),
+                        y="count()"
+                    ).properties(height=350)
+                    st.altair_chart(hist, use_container_width=True)
+                with c2:
+                    box = alt.Chart(pd.DataFrame({col: X[col], "target": y})).mark_boxplot().encode(
+                        x="target:N", y=f"{col}:Q"
+                    ).properties(height=350)
+                    st.altair_chart(box, use_container_width=True)
 
     st.markdown("---")
     st.markdown("#### Correlation (numeric only)")
@@ -316,49 +336,54 @@ elif page == "Train & Evaluate":
 
         submitted = st.form_submit_button("Train")
     if submitted:
-        with st.spinner("Training..."):
-            model, metrics, cm, labels, splits = train_model(X, y, model_name, params, test_size, random_state)
+        try:
+            with st.spinner("Training..."):
+                model, metrics, cm, labels, splits = train_model(X, y, model_name, params, test_size, random_state)
 
-        st.success("Training complete.")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Accuracy", f"{metrics['accuracy']:.3f}")
-        m2.metric("F1 (macro)", f"{metrics['f1_macro']:.3f}")
-        m3.metric("ROC AUC", f"{metrics['roc_auc']:.3f}" if not np.isnan(metrics['roc_auc']) else "—")
+            st.success("Training complete.")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Accuracy", f"{metrics['accuracy']:.3f}")
+            m2.metric("F1 (macro)", f"{metrics['f1_macro']:.3f}")
+            m3.metric("ROC AUC", f"{metrics['roc_auc']:.3f}" if not np.isnan(metrics['roc_auc']) else "—")
 
-        st.markdown("#### Confusion Matrix")
-        fig, ax = plt.subplots()
-        ax.imshow(cm, cmap="Blues")
-        ax.set_xticks(range(len(labels))); ax.set_yticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=45, ha="right"); ax.set_yticklabels(labels)
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                ax.text(j, i, cm[i, j], ha="center", va="center", color="black")
-        ax.set_xlabel("Predicted"); ax.set_ylabel("True")
-        st.pyplot(fig, clear_figure=True)
+            st.markdown("#### Confusion Matrix")
+            fig, ax = plt.subplots()
+            ax.imshow(cm, cmap="Blues")
+            ax.set_xticks(range(len(labels))); ax.set_yticks(range(len(labels)))
+            ax.set_xticklabels(labels, rotation=45, ha="right"); ax.set_yticklabels(labels)
+            for i in range(cm.shape[0]):
+                for j in range(cm.shape[1]):
+                    ax.text(j, i, cm[i, j], ha="center", va="center", color="black")
+            ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+            st.pyplot(fig, clear_figure=True)
 
-        st.markdown("#### Classification Report")
-        st.code(metrics["report"])
+            st.markdown("#### Classification Report")
+            st.code(metrics["report"])
 
-        from sklearn.preprocessing import label_binarize
-        X_train, X_val, y_train, y_val = splits
-        if hasattr(model, "predict_proba"):
-            try:
-                proba = model.predict_proba(X_val)
-                fig2, ax2 = plt.subplots()
-                if proba.shape[1] == 2:
-                    RocCurveDisplay.from_predictions(y_val, proba[:, 1], name="ROC", ax=ax2)
-                else:
-                    classes = model.classes_
-                    y_bin = label_binarize(y_val, classes=classes)
-                    for i, cls in enumerate(classes):
-                        RocCurveDisplay.from_predictions(y_bin[:, i], proba[:, i], name=f"ROC: {cls}", ax=ax2)
-                st.pyplot(fig2, clear_figure=True)
-            except Exception:
-                st.info("Could not render ROC curves for this configuration.")
+            from sklearn.preprocessing import label_binarize
+            X_train, X_val, y_train, y_val = splits
+            if hasattr(model, "predict_proba"):
+                try:
+                    proba = model.predict_proba(X_val)
+                    fig2, ax2 = plt.subplots()
+                    if proba.shape[1] == 2:
+                        RocCurveDisplay.from_predictions(y_val, proba[:, 1], name="ROC", ax=ax2)
+                    else:
+                        classes = model.classes_
+                        y_bin = label_binarize(y_val, classes=classes)
+                        for i, cls in enumerate(classes):
+                            RocCurveDisplay.from_predictions(y_bin[:, i], proba[:, i], name=f"ROC: {cls}", ax=ax2)
+                    st.pyplot(fig2, clear_figure=True)
+                except Exception:
+                    st.info("Could not render ROC curves for this configuration.")
 
-        st.session_state["trained_model"] = model
-        st.session_state["feature_columns"] = list(X.columns)
-        st.session_state["train_df"] = pd.concat([X, y.rename(label_col)], axis=1)
+            # Persist for Single-Case Prediction
+            st.session_state["trained_model"] = model
+            st.session_state["feature_columns"] = list(X.columns)
+            st.session_state["train_df"] = pd.concat([X, y.rename(label_col)], axis=1)
+
+        except ValueError as e:
+            st.error(f"Training failed: {e}")
 
 elif page == "Single-Case Prediction":
     st.title("Single-Case Prediction")
