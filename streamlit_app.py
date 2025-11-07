@@ -14,6 +14,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report,
     RocCurveDisplay
@@ -24,10 +25,9 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 st.set_page_config(page_title="Alzheimer’s ML Dashboard", layout="wide", page_icon="🧠")
 
 # ---------------------- Utilities ----------------------
-DEFAULT_PATH = "oasis_longitudinal.csv" # fallback to your expanded CSV
+DEFAULT_PATH = "oasis_longitudinal.csv"  # local csv in same folder
 
 PRIORITY_LABELS = ["group", "target", "label", "class", "diagnosis", "dx", "status", "outcome", "cdr", "dementia", "y"]
-
 ID_LIKE_HINTS = ["id", "subject", "mri", "visit"]
 
 def pick_label_column(df: pd.DataFrame) -> str:
@@ -69,6 +69,7 @@ def load_data(uploaded_file) -> pd.DataFrame:
         if os.path.exists(DEFAULT_PATH):
             df = pd.read_csv(DEFAULT_PATH)
         else:
+            st.error(f"CSV not found at {DEFAULT_PATH}. Upload a file or place it alongside app.py.")
             st.stop()
     return df
 
@@ -88,8 +89,15 @@ def type_columns(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
     return num_cols, cat_cols
 
 def make_pipeline(num_cols: List[str], cat_cols: List[str], model_name: str, params: Dict):
-    numeric = Pipeline(steps=[("scaler", StandardScaler())])
-    categorical = Pipeline(steps=[("onehot", OneHotEncoder(handle_unknown="ignore"))])
+    # ✅ Add imputers so NaNs never reach the model
+    numeric = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+    categorical = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ])
     pre = ColumnTransformer(
         transformers=[
             ("num", numeric, num_cols),
@@ -97,7 +105,7 @@ def make_pipeline(num_cols: List[str], cat_cols: List[str], model_name: str, par
         ]
     )
     if model_name == "Logistic Regression":
-        clf = LogisticRegression(max_iter=params.get("max_iter", 200), C=params.get("C", 1.0), n_jobs=None, multi_class="auto")
+        clf = LogisticRegression(max_iter=params.get("max_iter", 200), C=params.get("C", 1.0))
     elif model_name == "Random Forest":
         clf = RandomForestClassifier(
             n_estimators=params.get("n_estimators", 300),
@@ -150,33 +158,39 @@ def train_model(X, y, model_name, params, test_size, random_state):
     labels = list(np.unique(y))
     return pipe, metrics, cm, labels, (X_train, X_val, y_train, y_val)
 
+def _fmt_num(v: float) -> str:
+    if not np.isfinite(v):
+        return "NA"
+    if abs(v) >= 1000 or (0 < abs(v) < 0.01):
+        return f"{v:.3e}"
+    return f"{v:.4g}"
+
 def auto_build_single_input(df: pd.DataFrame, X_cols: List[str]) -> Dict[str, any]:
     """
     Build UI inputs for a single-case form using training column types & ranges.
+    - Numeric: free number input with range hint in the label
+    - Categorical: dropdown with seen categories
     Returns a dict {colname: value}
     """
     st.subheader("Enter values")
     values = {}
     for c in X_cols:
         series = df[c]
+        # Categorical
         if series.dtype == "object" or str(series.dtype) == "category" or series.dtype == "bool":
             opts = sorted([o for o in series.dropna().unique().tolist()])
-            default = opts[0] if opts else ""
             values[c] = st.selectbox(c, options=opts if len(opts) > 0 else [""])
         else:
-            s = pd.to_numeric(series, errors="coerce")
-            s = s.dropna()
+            s = pd.to_numeric(series, errors="coerce").dropna()
             if len(s) == 0:
                 values[c] = st.number_input(c, value=0.0)
             else:
                 mn, mx = float(s.min()), float(s.max())
                 mean_val = float(s.mean())
                 step = (mx - mn) / 100 if mx > mn else 1.0
-                # guard wide ranges
-                if np.isfinite(mn) and np.isfinite(mx):
-                    values[c] = st.number_input(c, value=mean_val, min_value=mn, max_value=mx, step=step)
-                else:
-                    values[c] = st.number_input(c, value=mean_val if np.isfinite(mean_val) else 0.0)
+                label = f"{c} [range: {_fmt_num(mn)} — {_fmt_num(mx)}]"
+                # Free entry (no min/max clamp)
+                values[c] = st.number_input(label, value=mean_val, step=step)
     return values
 
 # ---------------------- Sidebar / Navigation ----------------------
@@ -184,10 +198,37 @@ st.sidebar.title("🧠 Alzheimer’s ML Dashboard")
 uploaded = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
 df = load_data(uploaded)
 
+# ---------- Basic cleaning to prevent NaNs reaching the model ----------
+# Optional OASIS normalization: Group 'Converted' -> 'Demented'
+if "Group" in df.columns:
+    df["Group"] = df["Group"].replace({"Converted": "Demented"})
+
+# Convert +/-inf to NaN
+df = df.replace([np.inf, -np.inf], np.nan)
+
+# Choose / confirm target
 st.sidebar.markdown("---")
 auto_label = pick_label_column(df)
-label_col = st.sidebar.selectbox("Target column", options=list(df.columns), index=list(df.columns).index(auto_label) if auto_label in df.columns else 0)
+label_col = st.sidebar.selectbox(
+    "Target column",
+    options=list(df.columns),
+    index=list(df.columns).index(auto_label) if auto_label in df.columns else 0
+)
 st.sidebar.caption(f"Auto-detected: **{auto_label}**")
+
+# Drop rows with missing target (required for stratify & modeling)
+missing_target = df[label_col].isna().sum()
+if missing_target > 0:
+    st.warning(f"Dropping {missing_target} rows with missing target `{label_col}`.")
+    df = df.dropna(subset=[label_col]).reset_index(drop=True)
+
+# Drop all-empty feature columns (entirely NaN after cleaning)
+empty_cols = [c for c in df.columns if c != label_col and df[c].isna().all()]
+if empty_cols:
+    st.info(f"Dropping all-empty columns: {', '.join(empty_cols)}")
+    df = df.drop(columns=empty_cols)
+
+# Suggest drops
 drop_suggest = suggest_drop_cols(df)
 drop_cols = st.sidebar.multiselect("Columns to drop (IDs, nearly-unique)", options=list(df.columns), default=[c for c in drop_suggest if c != label_col])
 
