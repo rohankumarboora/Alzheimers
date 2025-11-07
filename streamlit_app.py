@@ -1,470 +1,340 @@
-# app.py — OASIS Longitudinal (NaN-safe, no upload, ranges & validation, Converted->Demented)
-# Streamlit Dashboard: EDA, Training, Single-Case Prediction
 
+import io
 import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import altair as alt
+import seaborn as sns
 import streamlit as st
 
-from typing import Tuple, Dict, List, Any
 from sklearn.model_selection import train_test_split
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
-    accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report,
-    RocCurveDisplay
+    roc_auc_score, accuracy_score, f1_score, precision_score, recall_score,
+    confusion_matrix, roc_curve, precision_recall_curve
 )
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 
-st.set_page_config(page_title="OASIS – Alzheimer’s ML Dashboard", layout="wide", page_icon="🧠")
+st.set_page_config(page_title="Diabetes Prediction – Model Bench", layout="wide")
+sns.set_style("whitegrid")
 
-# ---------------------- Config ----------------------
-DEFAULT_PATH = "/mnt/data/oasis_longitudinal.csv"  # fixed OASIS dataset path
-PRIORITY_LABELS = ["group"]  # prefer 'Group'
-ID_LIKE_HINTS = ["subject id", "mri id"]  # typical OASIS ID-ish columns
+# ------------- Sidebar Controls -------------
+st.sidebar.title("⚙️ Controls")
 
-# ---------------------- Utilities ----------------------
-def pick_label_column(df: pd.DataFrame) -> str:
-    # Prefer 'Group' if present and sensible
-    if "Group" in df.columns and df["Group"].nunique(dropna=True) > 1:
-        return "Group"
-    # Otherwise use heuristics
-    cols = list(df.columns)
-    lowermap = {c: c.lower() for c in cols}
-    for c in cols:
-        if lowermap[c] in PRIORITY_LABELS and df[c].nunique(dropna=True) > 1:
-            return c
-    candidates = []
-    for c in cols:
-        nunq = df[c].nunique(dropna=True)
-        if 1 < nunq <= 10 and nunq < len(df) * 0.5:
-            candidates.append((nunq, c))
-    if candidates:
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
-    return cols[-1]
+uploaded = st.sidebar.file_uploader("Upload CSV (expects 'Diabetes_binary' as target)", type=["csv"])
+default_path = "diabetes dataset.csv"
 
-def suggest_drop_cols(df: pd.DataFrame) -> List[str]:
-    drops = []
-    for c in df.columns:
-        if c.lower() in ID_LIKE_HINTS:
-            drops.append(c)
-    # Nearly-unique identifiers
-    n = len(df)
-    for c in df.columns:
-        if df[c].nunique(dropna=True) > 0.9 * n and c not in drops and c != "Group":
-            drops.append(c)
-    # Keep 'Visit' if present
-    drops = [d for d in drops if d.lower() != "visit"]
-    return sorted(list(set(drops)))
+test_size = st.sidebar.slider("Test size", 0.1, 0.4, 0.20, 0.01)
+random_state = st.sidebar.number_input("Random state", min_value=0, value=42, step=1)
 
-@st.cache_data(show_spinner=False)
-def load_data() -> pd.DataFrame:
-    if not os.path.exists(DEFAULT_PATH):
-        st.error(
-            f"Data file not found at `{DEFAULT_PATH}`.\n\n"
-            "Please place the OASIS CSV there or change DEFAULT_PATH in the code."
-        )
-        st.stop()
-    df = pd.read_csv(DEFAULT_PATH)
-    return df
-
-def split_features_target(df: pd.DataFrame, target_col: str, drop_cols: List[str]) -> Tuple[pd.DataFrame, pd.Series]:
-    cols = [c for c in df.columns if c != target_col and c not in drop_cols]
-    X = df[cols].copy()
-    y = df[target_col].copy()
-    return X, y
-
-def type_columns(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    cat_cols = [c for c in X.columns if X[c].dtype == "object" or str(X[c].dtype) == "category" or X[c].dtype == "bool"]
-    num_cols = [c for c in X.columns if c not in cat_cols]
-    return num_cols, cat_cols
-
-def make_pipeline(num_cols: List[str], cat_cols: List[str], model_name: str, params: Dict):
-    # Robust preprocessing: imputation + scaling/OHE
-    numeric = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler())
-    ])
-    categorical = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore"))
-    ])
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", numeric, num_cols),
-            ("cat", categorical, cat_cols),
-        ]
-    )
-    if model_name == "Logistic Regression":
-        clf = LogisticRegression(max_iter=params.get("max_iter", 300), C=params.get("C", 1.0))
-    elif model_name == "Random Forest":
-        clf = RandomForestClassifier(
-            n_estimators=params.get("n_estimators", 400),
-            max_depth=params.get("max_depth", None),
-            random_state=42
-        )
-    elif model_name == "Gradient Boosting":
-        clf = GradientBoostingClassifier(
-            n_estimators=params.get("n_estimitors", 300) if "n_estimators" not in params else params["n_estimators"],
-            learning_rate=params.get("learning_rate", 0.05),
-            max_depth=params.get("max_depth", 3),
-            random_state=42
-        )
-    else:
-        raise ValueError("Unknown model")
-    pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
-    return pipe
-
-def safe_roc_auc(model, X_val, y_val):
-    try:
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(X_val)
-            if proba.shape[1] > 2:
-                return roc_auc_score(y_val, proba, multi_class="ovr")
-            else:
-                return roc_auc_score(y_val, proba[:, 1])
-        return np.nan
-    except Exception:
-        return np.nan
-
-@st.cache_resource(show_spinner=False)
-def train_model(X, y, model_name, params, test_size, random_state):
-    # Guard: stratify needs >=2 classes
-    if pd.Series(y).nunique(dropna=True) < 2:
-        raise ValueError("Target has fewer than 2 classes after cleaning. Please adjust target or filters.")
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y
-    )
-    num_cols, cat_cols = type_columns(X_train)
-    pipe = make_pipeline(num_cols, cat_cols, model_name, params)
-    pipe.fit(X_train, y_train)
-    yhat = pipe.predict(X_val)
-    metrics = {
-        "accuracy": accuracy_score(y_val, yhat),
-        "f1_macro": f1_score(y_val, yhat, average="macro"),
-        "roc_auc": safe_roc_auc(pipe, X_val, y_val),
-        "report": classification_report(y_val, yhat, digits=3)
-    }
-    cm = confusion_matrix(y_val, yhat, labels=np.unique(y))
-    labels = list(np.unique(y))
-    return pipe, metrics, cm, labels, (X_train, X_val, y_train, y_val)
-
-def _fmt_num(v: float) -> str:
-    if not np.isfinite(v):
-        return "NA"
-    if abs(v) >= 1000 or (0 < abs(v) < 0.01):
-        return f"{v:.3e}"
-    return f"{v:.4g}"
-
-def auto_build_single_input(
-    df: pd.DataFrame,
-    X_cols: List[str]
-) -> Tuple[Dict[str, Any], Dict[str, Tuple[float, float]], List[str]]:
-    """
-    Build UI inputs for a single-case form using training column types & ranges.
-    - Numeric: free-form number input (no hard min/max), label shows [range: min — max]
-    - Categorical: dropdown with seen categories
-    Returns (values_dict, range_stats, numeric_cols_list)
-      - values_dict: {col: value}
-      - range_stats: {num_col: (min, max)}
-      - numeric_cols_list: list of numeric column names
-    """
-    st.subheader("Enter values")
-    values: Dict[str, Any] = {}
-    range_stats: Dict[str, Tuple[float, float]] = {}
-    numeric_cols_list: List[str] = []
-
-    for c in X_cols:
-        series = df[c]
-
-        # CATEGORICAL -> dropdown
-        if series.dtype == "object" or str(series.dtype) == "category" or series.dtype == "bool":
-            opts = sorted([o for o in series.dropna().unique().tolist()])
-            label = f"{c} (choices: {len(opts)})" if len(opts) > 0 else f"{c}"
-            values[c] = st.selectbox(label, options=opts if len(opts) > 0 else [""])
-            continue
-
-        # NUMERIC -> free number input + range hint in label
-        s = pd.to_numeric(series, errors="coerce").dropna()
-        if len(s) == 0:
-            values[c] = st.number_input(c, value=0.0, help="No numeric stats available for this field.")
-            continue
-
-        mn, mx = float(s.min()), float(s.max())
-        range_stats[c] = (mn, mx)
-        numeric_cols_list.append(c)
-
-        label = f"{c} [range: {_fmt_num(mn)} — {_fmt_num(mx)}]"
-        step = (mx - mn) / 100 if mx > mn else 1.0
-        mean_val = float(s.mean())
-        default_val = mean_val if np.isfinite(mean_val) else (mn if np.isfinite(mn) else 0.0)
-
-        values[c] = st.number_input(
-            label,
-            value=float(default_val),
-            step=float(step) if np.isfinite(step) and step > 0 else 1.0,
-            help="Suggested range shown; you can enter any value."
-        )
-
-    return values, range_stats, numeric_cols_list
-
-# ---------------------- Sidebar / Navigation ----------------------
-st.sidebar.title("🧠 OASIS – Alzheimer’s ML Dashboard")
-st.sidebar.markdown(f"**Data path:** `{DEFAULT_PATH}`")
-
-# Load raw df and select label first
-raw_df = load_data()
-
-# ----- Requested rule: Convert 'Converted' -> 'Demented' in Group -----
-if "Group" in raw_df.columns:
-    raw_df["Group"] = raw_df["Group"].replace({"Converted": "Demented"})
-
-auto_label = pick_label_column(raw_df)
-label_col = st.sidebar.selectbox(
-    "Target column",
-    options=list(raw_df.columns),
-    index=list(raw_df.columns).index(auto_label) if auto_label in raw_df.columns else 0
-)
-st.sidebar.caption(f"Auto-detected: **{auto_label}**")
-
-# ---- Clean missing values AFTER selecting target ----
-df = raw_df.replace([np.inf, -np.inf], np.nan)
-
-if label_col not in df.columns:
-    st.error("Selected target column not in dataframe.")
-    st.stop()
-
-missing_target_rows = df[label_col].isna().sum()
-if missing_target_rows > 0:
-    st.warning(f"Dropping {missing_target_rows} rows with missing target `{label_col}`.")
-    df = df.dropna(subset=[label_col]).reset_index(drop=True)
-
-# Drop all-empty feature cols (entirely NaN)
-empty_feature_cols = [c for c in df.columns if c != label_col and df[c].isna().all()]
-if empty_feature_cols:
-    st.info(f"Dropping all-empty columns: {', '.join(empty_feature_cols)}")
-    df = df.drop(columns=empty_feature_cols)
-
-# Now compute drop suggestions on the cleaned df
-default_drops = [c for c in ["Subject ID", "MRI ID"] if c in df.columns]
-drop_suggest = sorted(list(set(default_drops + suggest_drop_cols(df))))
-drop_cols = st.sidebar.multiselect(
-    "Columns to drop (IDs, nearly-unique)",
-    options=list(df.columns),
-    default=[c for c in drop_suggest if c != label_col]
-)
+rf_n_estimators = st.sidebar.slider("Random Forest: n_estimators", 100, 1000, 300, 50)
+gb_learning_rate = st.sidebar.select_slider("Gradient Boosting: learning_rate", options=[0.01, 0.05, 0.1, 0.2], value=0.1)
+threshold = st.sidebar.slider("Classification threshold", 0.1, 0.9, 0.5, 0.01)
+topn_importance = st.sidebar.slider("Top-N feature importance", 5, 30, 15, 1)
 
 st.sidebar.markdown("---")
-page = st.sidebar.radio("Navigate", ["Overview", "Explore (EDA)", "Train & Evaluate", "Single-Case Prediction"])
+st.sidebar.info("Tip: Run this app with: `streamlit run streamlit_app.py`.\n\nIf no file is uploaded, the app looks for **diabetes dataset.csv** in the working directory.")
 
-# Derive X/y
-if label_col not in df.columns:
-    st.error("Selected target column not in dataframe after cleaning.")
+# ------------- Data Loading -------------
+@st.cache_data(show_spinner=False)
+def load_data(file_buffer, fallback_path):
+    if file_buffer is not None:
+        df = pd.read_csv(file_buffer)
+    else:
+        if not os.path.exists(fallback_path):
+            raise FileNotFoundError(
+                "No file uploaded and default 'diabetes dataset.csv' not found in current directory."
+            )
+        df = pd.read_csv(fallback_path)
+    return df
+
+try:
+    df = load_data(uploaded, default_path)
+except Exception as e:
+    st.error(f"❌ {e}")
     st.stop()
-X, y = split_features_target(df, label_col, drop_cols)
 
-# ---------------------- Pages ----------------------
-if page == "Overview":
-    st.title("Overview")
-    c1, c2 = st.columns([2, 1], gap="large")
+st.success(f"Loaded dataset with shape {df.shape}")
+with st.expander("🔎 Preview & Columns", expanded=False):
+    st.write(df.head())
+    st.write("Columns:", list(df.columns))
 
-    with c1:
-        st.markdown("### Dataset Snapshot")
-        st.dataframe(df.head(20), use_container_width=True)
-        st.markdown(f"- **Rows:** {len(df)}  \n- **Columns:** {len(df.columns)}")
-        st.markdown(f"- **Target:** `{label_col}`  \n- **Dropped:** {', '.join(drop_cols) if drop_cols else 'None'}")
+if "Diabetes_binary" not in df.columns:
+    st.error("Expected target column 'Diabetes_binary' not found!")
+    st.stop()
 
-    with c2:
-        st.markdown("### Class Distribution")
-        vc = y.value_counts(dropna=False)
-        st.write(vc)
-        cd = pd.DataFrame({"class": vc.index.astype(str), "count": vc.values})
-        chart = (
-            alt.Chart(cd)
-            .mark_bar()
-            .encode(x=alt.X("class:N", sort="-y", title="Class"),
-                    y=alt.Y("count:Q", title="Count"),
-                    tooltip=["class", "count"])
-            .properties(height=300)
-        )
-        st.altair_chart(chart, use_container_width=True)
+# Split X, y and coerce numerics
+y = df["Diabetes_binary"].astype(int)
+X = df.drop(columns=["Diabetes_binary"]).copy()
+for c in X.columns:
+    X[c] = pd.to_numeric(X[c], errors="coerce")
 
-    st.markdown("### Column Types")
-    num_cols, cat_cols = type_columns(X)
-    col1, col2 = st.columns(2)
-    with col1:
-        st.write("**Numeric:**", num_cols if num_cols else "—")
-    with col2:
-        st.write("**Categorical:**", cat_cols if cat_cols else "—")
+# Train/test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=test_size, random_state=random_state, stratify=y
+)
 
-elif page == "Explore (EDA)":
-    st.title("Explore (EDA)")
-    st.markdown("Select columns to visualize distributions and relationships.")
+# Preprocess & models (constructed with current sidebar params)
+numeric_preprocess = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
 
-    if len(X.columns) == 0:
-        st.error("No feature columns available after drops. Please adjust drop list.")
-    else:
-        col = st.selectbox("Choose a column", options=list(X.columns))
-        if col:
-            if X[col].dtype == "object" or str(X[col].dtype) == "category" or X[col].dtype == "bool":
-                st.markdown(f"#### Categorical: {col}")
-                vc = X[col].value_counts(dropna=False)
-                cat_df = pd.DataFrame({col: vc.index.astype(str), "count": vc.values})
-                chart = (
-                    alt.Chart(cat_df)
-                    .mark_bar()
-                    .encode(x=alt.X(f"{col}:N", sort="-y"), y="count:Q", tooltip=[col, "count"])
-                    .properties(height=350)
-                )
-                st.altair_chart(chart, use_container_width=True)
-                st.markdown("#### Cross by Target")
-                cross = pd.crosstab(X[col].astype(str), y)
-                st.dataframe(cross, use_container_width=True)
-            else:
-                st.markdown(f"#### Numeric: {col}")
-                c1, c2 = st.columns(2)
-                with c1:
-                    hist = alt.Chart(pd.DataFrame({col: X[col]})).mark_bar().encode(
-                        alt.X(f"{col}:Q", bin=alt.Bin(maxbins=30)),
-                        y="count()"
-                    ).properties(height=350)
-                    st.altair_chart(hist, use_container_width=True)
-                with c2:
-                    box = alt.Chart(pd.DataFrame({col: X[col], "target": y})).mark_boxplot().encode(
-                        x="target:N", y=f"{col}:Q"
-                    ).properties(height=350)
-                    st.altair_chart(box, use_container_width=True)
+models = {
+    "Logistic Regression": Pipeline([
+        ("prep", numeric_preprocess),
+        ("clf", LogisticRegression(max_iter=1000, random_state=random_state))
+    ]),
+    "Random Forest": Pipeline([
+        ("prep", numeric_preprocess),
+        ("clf", RandomForestClassifier(n_estimators=rf_n_estimators, random_state=random_state, n_jobs=-1))
+    ]),
+    "Gradient Boosting": Pipeline([
+        ("prep", numeric_preprocess),
+        ("clf", GradientBoostingClassifier(random_state=random_state, learning_rate=gb_learning_rate))
+    ])
+}
 
-    st.markdown("---")
-    st.markdown("#### Correlation (numeric only)")
-    num_cols, _ = type_columns(X)
-    if len(num_cols) >= 2:
-        corr = X[num_cols].corr(numeric_only=True)
-        st.dataframe(corr.style.background_gradient(cmap="Blues"), use_container_width=True)
-    else:
-        st.info("Not enough numeric columns for correlation heatmap.")
+# ------------- Training & Evaluation -------------
+def evaluate_model(name, pipe, X_train, X_test, y_train, y_test, thr=0.5):
+    pipe.fit(X_train, y_train)
+    proba = None
+    if hasattr(pipe.named_steps["clf"], "predict_proba"):
+        proba = pipe.predict_proba(X_test)[:, 1]
+    elif hasattr(pipe.named_steps["clf"], "decision_function"):
+        scores = pipe.decision_function(X_test)
+        proba = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
 
-elif page == "Train & Evaluate":
-    st.title("Train & Evaluate")
-    st.markdown("Tune settings, train a model, and review performance.")
+    y_pred = (proba >= thr).astype(int) if proba is not None else pipe.predict(X_test)
 
-    with st.form("train_form"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            model_name = st.selectbox("Model", ["Logistic Regression", "Random Forest", "Gradient Boosting"])
-            test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.01)
-        with c2:
-            random_state = st.number_input("Random state", min_value=0, value=42, step=1)
-        with c3:
-            st.caption("Hyperparameters")
-            params = {}
-            if model_name == "Logistic Regression":
-                params["C"] = st.number_input("C (inverse regularization)", min_value=0.001, value=1.0, step=0.1)
-                params["max_iter"] = st.number_input("max_iter", min_value=50, value=300, step=50)
-            elif model_name == "Random Forest":
-                params["n_estimators"] = st.number_input("n_estimators", min_value=50, value=400, step=50)
-                max_depth = st.text_input("max_depth (blank = None)", value="")
-                params["max_depth"] = None if max_depth.strip() == "" else int(max_depth)
-            elif model_name == "Gradient Boosting":
-                params["n_estimators"] = st.number_input("n_estimators", min_value=50, value=300, step=50)
-                params["learning_rate"] = st.number_input("learning_rate", min_value=0.001, value=0.05, step=0.01)
-                params["max_depth"] = st.number_input("max_depth (trees)", min_value=1, value=3, step=1)
+    metrics = {
+        "AUC": roc_auc_score(y_test, proba) if proba is not None else np.nan,
+        "Accuracy": accuracy_score(y_test, y_pred),
+        "Precision": precision_score(y_test, y_pred, zero_division=0),
+        "Recall": recall_score(y_test, y_pred),
+        "F1": f1_score(y_test, y_pred),
+        "ConfusionMatrix": confusion_matrix(y_test, y_pred),
+        "proba": proba,
+        "y_pred": y_pred
+    }
+    return metrics, pipe
 
-        submitted = st.form_submit_button("Train")
-    if submitted:
-        try:
-            with st.spinner("Training..."):
-                model, metrics, cm, labels, splits = train_model(X, y, model_name, params, test_size, random_state)
+# Cache training, ignoring unhashable 'models' dict
+@st.cache_resource(show_spinner=True)
+def train_all_models(_models_dict, X_train, X_test, y_train, y_test, thr):
+    results = {}
+    fitted = {}
+    for name, pipe in _models_dict.items():
+        res, fitted_pipe = evaluate_model(name, pipe, X_train, X_test, y_train, y_test, thr=thr)
+        results[name] = res
+        fitted[name] = fitted_pipe
+    return results, fitted
 
-            st.success("Training complete.")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Accuracy", f"{metrics['accuracy']:.3f}")
-            m2.metric("F1 (macro)", f"{metrics['f1_macro']:.3f}")
-            m3.metric("ROC AUC", f"{metrics['roc_auc']:.3f}" if not np.isnan(metrics['roc_auc']) else "—")
+with st.spinner("Training models..."):
+    results, fitted = train_all_models(models, X_train, X_test, y_train, y_test, threshold)
 
-            st.markdown("#### Confusion Matrix")
-            fig, ax = plt.subplots()
-            ax.imshow(cm, cmap="Blues")
-            ax.set_xticks(range(len(labels))); ax.set_yticks(range(len(labels)))
-            ax.set_xticklabels(labels, rotation=45, ha="right"); ax.set_yticklabels(labels)
-            for i in range(cm.shape[0]):
-                for j in range(cm.shape[1]):
-                    ax.text(j, i, cm[i, j], ha="center", va="center", color="black")
-            ax.set_xlabel("Predicted"); ax.set_ylabel("True")
-            st.pyplot(fig, clear_figure=True)
+# Metrics table
+metrics_table = pd.DataFrame({
+    mname: {
+        "AUC": res["AUC"],
+        "Accuracy": res["Accuracy"],
+        "Precision": res["Precision"],
+        "Recall": res["Recall"],
+        "F1": res["F1"]
+    } for mname, res in results.items()
+}).T
 
-            st.markdown("#### Classification Report")
-            st.code(metrics["report"])
+# Helper to pick best by AUC
+def pick_best(table):
+    auc_vals = table["AUC"].fillna(-np.inf)
+    best_by_auc = auc_vals.idxmax()
+    return best_by_auc, table.loc[best_by_auc, "AUC"]
 
-            from sklearn.preprocessing import label_binarize
-            X_train, X_val, y_train, y_val = splits
-            if hasattr(model, "predict_proba"):
+best_model_name, best_auc = pick_best(metrics_table)
+
+# ------------- Layout: Tabs -------------
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Overview", "📈 ROC & PR", "🧮 Confusion Matrices",
+    "🌲 Feature Importance", "📋 Compare Metrics", "🔮 Predict Single Case"
+])
+
+with tab1:
+    st.subheader("Overall Evaluation")
+    st.dataframe(metrics_table.round(4))
+    st.info(f"**Best model by AUC:** {best_model_name}  (AUC = {best_auc:.4f})")
+
+with tab2:
+    col_roc, col_pr = st.columns(2)
+    with col_roc:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        for name, res in results.items():
+            if res["proba"] is not None:
+                fpr, tpr, _ = roc_curve(y_test, res["proba"])
+                ax.plot(fpr, tpr, lw=2, label=f"{name} (AUC = {res['AUC']:.3f})")
+        ax.plot([0, 1], [0, 1], "--", color="gray", lw=1, label="Random (AUC = 0.500)")
+        ax.set_title("ROC Curves")
+        ax.set_xlabel("False Positive Rate (1 - Specificity)")
+        ax.set_ylabel("True Positive Rate (Recall)")
+        ax.legend(loc="lower right", frameon=True, fontsize=8)
+        ax.set_xlim([0, 1])
+        ax.set_ylim([0, 1])
+        st.pyplot(fig)
+
+    with col_pr:
+        fig2, ax2 = plt.subplots(figsize=(5, 4))
+        for name, res in results.items():
+            if res["proba"] is not None:
+                prec, rec, _ = precision_recall_curve(y_test, res["proba"])
+                ax2.plot(rec, prec, lw=2, label=f"{name}")
+        baseline = y_test.mean()
+        ax2.hlines(baseline, 0, 1, linestyles="--", label=f"Prevalence = {baseline:.2f}")
+        ax2.set_title("Precision–Recall Curves")
+        ax2.set_xlabel("Recall (Sensitivity)")
+        ax2.set_ylabel("Precision (PPV)")
+        ax2.legend(loc="best", frameon=True, fontsize=8)
+        ax2.set_xlim([0, 1])
+        ax2.set_ylim([0, 1])
+        st.pyplot(fig2)
+
+with tab3:
+    st.subheader("Confusion Matrices")
+    cols = st.columns(3)
+    for idx, (name, res) in enumerate(results.items()):
+        cm = res["ConfusionMatrix"]
+        fig_cm, ax_cm = plt.subplots(figsize=(4.5, 4))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, ax=ax_cm,
+                    annot_kws={"size": 12})
+        ax_cm.set_title(f"{name}")
+        ax_cm.set_xlabel("Predicted Label")
+        ax_cm.set_ylabel("True Label")
+        ax_cm.set_xticklabels(["0 (No Diabetes)", "1 (Diabetes)"], rotation=20)
+        ax_cm.set_yticklabels(["0 (No Diabetes)", "1 (Diabetes)"], rotation=0)
+        cols[idx].pyplot(fig_cm)
+
+with tab4:
+    st.subheader("Tree-Based Feature Importances")
+    def plot_feature_importance(pipe, title, feature_names, top_n=15):
+        clf = pipe.named_steps["clf"]
+        if hasattr(clf, "feature_importances_"):
+            importances = pd.Series(clf.feature_importances_, index=feature_names)
+            top = importances.sort_values(ascending=False).head(top_n)[::-1]
+            fig_imp, ax_imp = plt.subplots(figsize=(6, 5))
+            ax_imp.barh(top.index, top.values)
+            ax_imp.set_title(f"Top {top_n} Features: {title}")
+            ax_imp.set_xlabel("Importance (Gini decrease)")
+            ax_imp.set_ylabel("Feature")
+            fig_imp.tight_layout()
+            return fig_imp
+        return None
+
+    for name in ["Random Forest", "Gradient Boosting"]:
+        fig_imp = plot_feature_importance(fitted[name], name, X.columns, top_n=topn_importance)
+        if fig_imp is not None:
+            st.pyplot(fig_imp)
+        else:
+            st.warning(f"{name} has no attribute 'feature_importances_'")
+
+with tab5:
+    st.subheader("Metric Comparison")
+    comp = metrics_table[["AUC", "Accuracy", "F1"]].copy()
+    fig_bar, ax_bar = plt.subplots(figsize=(7, 4))
+    comp.plot(kind="bar", rot=0, ax=ax_bar)
+    ax_bar.set_title("Model Comparison: AUC, Accuracy, F1")
+    ax_bar.set_xlabel("Model")
+    ax_bar.set_ylabel("Score")
+    ax_bar.set_ylim(0, 1)
+    ax_bar.legend(title="Metric", loc="lower right", frameon=True, fontsize=8)
+    ax_bar.grid(axis="y", linestyle="--", alpha=0.5)
+    fig_bar.tight_layout()
+    st.pyplot(fig_bar)
+
+
+with tab6:
+    st.subheader("Predict for a Single Person")
+    st.caption("Binary features (0/1) are shown as dropdowns. Others are text boxes. Empty/invalid inputs fallback to training **median**.")
+
+    defaults = X_train.median(numeric_only=True)
+
+    # Detect binary columns: non-null unique values subset of {0,1}
+    binary_cols = set()
+    for col in X.columns:
+        vals = pd.Series(X[col]).dropna().unique()
+        if len(vals) > 0:
+            # Coerce to floats then compare set membership
+            try:
+                vals = np.array(vals, dtype=float)
+                unique_set = set(np.unique(vals).tolist())
+                if unique_set.issubset({0.0, 1.0}):
+                    binary_cols.add(col)
+            except Exception:
+                pass
+
+    cols_layout = st.columns(3)
+    user_input_raw = {}
+
+    for i, col in enumerate(X.columns):
+        with cols_layout[i % 3]:
+            if col in binary_cols:
+                # Default to rounded median within {0,1}
+                dflt = defaults.get(col, 0.0)
                 try:
-                    proba = model.predict_proba(X_val)
-                    fig2, ax2 = plt.subplots()
-                    if proba.shape[1] == 2:
-                        RocCurveDisplay.from_predictions(y_val, proba[:, 1], name="ROC", ax=ax2)
-                    else:
-                        classes = model.classes_
-                        y_bin = label_binarize(y_val, classes=classes)
-                        for i, cls in enumerate(classes):
-                            RocCurveDisplay.from_predictions(y_bin[:, i], proba[:, i], name=f"ROC: {cls}", ax=ax2)
-                    st.pyplot(fig2, clear_figure=True)
+                    dflt = int(round(float(dflt)))
                 except Exception:
-                    st.info("Could not render ROC curves for this configuration.")
+                    dflt = 0
+                dflt = 1 if dflt == 1 else 0
+                choice = st.selectbox(col, options=[0,1], index=[0,1].index(dflt))
+                user_input_raw[col] = choice
+            else:
+                placeholder = "" if pd.isna(defaults.get(col, np.nan)) else str(float(defaults[col]))
+                txt = st.text_input(col, value="", placeholder=placeholder)
+                user_input_raw[col] = txt
 
-            # Persist for Single-Case Prediction
-            st.session_state["trained_model"] = model
-            st.session_state["feature_columns"] = list(X.columns)
-            st.session_state["train_df"] = pd.concat([X, y.rename(label_col)], axis=1)
+    # Build parsed dataframe
+    parsed = {}
+    parse_warnings = []
 
-        except ValueError as e:
-            st.error(f"Training failed: {e}")
+    for col in X.columns:
+        val = user_input_raw[col]
+        if col in binary_cols:
+            # Already int 0/1 from selectbox
+            parsed[col] = int(val)
+        else:
+            # Text -> float with median fallback
+            if val is None or str(val).strip() == "":
+                parsed[col] = float(defaults[col]) if pd.notna(defaults[col]) else 0.0
+            else:
+                try:
+                    parsed[col] = float(val)
+                except Exception:
+                    parsed[col] = float(defaults[col]) if pd.notna(defaults[col]) else 0.0
+                    parse_warnings.append(col)
 
-elif page == "Single-Case Prediction":
-    st.title("Single-Case Prediction")
-    if "trained_model" not in st.session_state or "feature_columns" not in st.session_state:
-        st.warning("Please train a model first on the **Train & Evaluate** page.")
-    else:
-        model = st.session_state["trained_model"]
-        feat_cols = st.session_state["feature_columns"]
-        train_df = st.session_state.get("train_df", pd.concat([X, y.rename(label_col)], axis=1))
+    input_df = pd.DataFrame([parsed])
+    chosen_model = st.selectbox("Choose model for inference", list(models.keys()), index=list(models.keys()).index(best_model_name))
 
-        # Build inputs (shows ranges for numeric, free typing)
-        with st.form("single_case"):
-            inputs, range_stats, numeric_cols = auto_build_single_input(train_df, feat_cols)
-            predict_btn = st.form_submit_button("Predict")
+    if st.button("Predict"):
+        if parse_warnings:
+            st.warning(f"These fields were non-numeric and were replaced by their median: {', '.join(parse_warnings)}")
 
-        if predict_btn:
-            # Assemble row for prediction
-            x_row = pd.DataFrame([inputs])[feat_cols]
+        mdl = fitted[chosen_model]
 
-            # Gentle validation: flag out-of-range numeric inputs
-            warnings = []
-            for c in numeric_cols:
-                val = x_row.loc[0, c]
-                if pd.isna(val) or c not in range_stats:
-                    continue
-                mn, mx = range_stats[c]
-                # only check if finite
-                if np.isfinite(val) and np.isfinite(mn) and np.isfinite(mx):
-                    if val < mn or val > mx:
-                        warnings.append(f"- **{c}** = {_fmt_num(val)} is outside training range [{_fmt_num(mn)}, {_fmt_num(mx)}].")
-            if warnings:
-                st.warning("Some inputs are outside the training range:\n" + "\n".join(warnings))
+        # Probability + class using current threshold
+        if hasattr(mdl.named_steps["clf"], "predict_proba"):
+            proba = mdl.predict_proba(input_df)[0, 1]
+            pred = int(proba >= threshold)
+        elif hasattr(mdl.named_steps["clf"], "decision_function"):
+            score = mdl.decision_function(input_df)[0]
+            proba = 1 / (1 + np.exp(-score))
+            pred = int(proba >= threshold)
+        else:
+            pred = int(mdl.predict(input_df)[0])
+            # If proba not available, synthesize from pred only
+            proba = float(pred)
 
-            # Predict
-            pred = model.predict(x_row)[0]
-            st.success(f"**Predicted class:** {pred}")
-            if hasattr(model, "predict_proba"):
-                proba = model.predict_proba(x_row).flatten()
-                prob_df = pd.DataFrame({"class": list(model.classes_), "probability": proba})
-                prob_df["probability"] = prob_df["probability"].round(4)
-                st.markdown("#### Class Probabilities")
-                st.dataframe(prob_df, use_container_width=True)
+        if pred == 1:
+            st.error("Prediction: **Diabetes**")
+        else:
+            st.success("Prediction: **No Diabetes**")
