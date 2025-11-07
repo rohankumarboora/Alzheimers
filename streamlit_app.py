@@ -1,5 +1,5 @@
-# app.py (no upload option)
-# Streamlit Dashboard: Alzheimer’s (OASIS Longitudinal) – EDA, Training, and Single-Case Prediction
+# app.py (OASIS Longitudinal specific)
+# Streamlit Dashboard: OASIS – EDA, Training, and Single-Case Prediction
 
 import os
 import numpy as np
@@ -13,6 +13,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report,
     RocCurveDisplay
@@ -20,23 +21,29 @@ from sklearn.metrics import (
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 
-st.set_page_config(page_title="Alzheimer’s ML Dashboard", layout="wide", page_icon="🧠")
+st.set_page_config(page_title="OASIS – Alzheimer’s ML Dashboard", layout="wide", page_icon="🧠")
 
 # ---------------------- Config ----------------------
-DEFAULT_PATH = "oasis_longitudinal.csv"  # fixed data source
+DEFAULT_PATH = "/mnt/data/oasis_longitudinal.csv"  # fixed OASIS dataset
 
-PRIORITY_LABELS = ["group", "target", "label", "class", "diagnosis", "dx", "status", "outcome", "cdr", "dementia", "y"]
-ID_LIKE_HINTS = ["id", "subject", "mri", "visit"]
+# For OASIS, typical columns include:
+# 'Subject ID','MRI ID','Group','Visit','MR Delay','M/F','Hand','Age','Educ','SES',
+# 'MMSE','CDR','eTIV','nWBV','ASF'
+PRIORITY_LABELS = ["group"]  # lock to Group if available
+ID_LIKE_HINTS = ["subject id", "mri id"]  # default drops for OASIS
 
 # ---------------------- Utilities ----------------------
 def pick_label_column(df: pd.DataFrame) -> str:
+    # Prefer 'Group' if present and has >1 class
+    if "Group" in df.columns and df["Group"].nunique(dropna=True) > 1:
+        return "Group"
+    # Otherwise fall back heuristics
     cols = list(df.columns)
     lowermap = {c: c.lower() for c in cols}
-    # Priority names
     for c in cols:
         if lowermap[c] in PRIORITY_LABELS and df[c].nunique(dropna=True) > 1:
             return c
-    # Low-cardinality categorical-ish
+    # Low-cardinality fallback
     candidates = []
     for c in cols:
         nunq = df[c].nunique(dropna=True)
@@ -45,19 +52,21 @@ def pick_label_column(df: pd.DataFrame) -> str:
     if candidates:
         candidates.sort(key=lambda x: x[0])
         return candidates[0][1]
-    # Fallback: last col
     return cols[-1]
 
 def suggest_drop_cols(df: pd.DataFrame) -> List[str]:
-    # Drop obviously ID-like and nearly-unique columns
     drops = []
-    n = len(df)
     for c in df.columns:
         lc = c.lower()
-        if any(h in lc for h in ID_LIKE_HINTS):
+        if lc in ID_LIKE_HINTS:
             drops.append(c)
-        elif df[c].nunique(dropna=True) > 0.9 * n:
+    # Also drop columns that are nearly-unique identifiers
+    n = len(df)
+    for c in df.columns:
+        if df[c].nunique(dropna=True) > 0.9 * n and c not in drops and c != "Group":
             drops.append(c)
+    # Keep 'Visit' (useful), so remove if accidentally added
+    drops = [d for d in drops if d.lower() != "visit"]
     return sorted(list(set(drops)))
 
 @st.cache_data(show_spinner=False)
@@ -65,16 +74,15 @@ def load_data() -> pd.DataFrame:
     if not os.path.exists(DEFAULT_PATH):
         st.error(
             f"Data file not found at `{DEFAULT_PATH}`.\n\n"
-            "Please place your dataset there (CSV) or change DEFAULT_PATH in the code."
+            "Please place the OASIS CSV there or change DEFAULT_PATH in the code."
         )
         st.stop()
-    return pd.read_csv(DEFAULT_PATH)
+    df = pd.read_csv(DEFAULT_PATH)
+    # Ensure expected OASIS columns are properly typed (optional soft coerce)
+    # (No hard renames here to be safe.)
+    return df
 
-def split_features_target(
-    df: pd.DataFrame,
-    target_col: str,
-    drop_cols: List[str]
-) -> Tuple[pd.DataFrame, pd.Series]:
+def split_features_target(df: pd.DataFrame, target_col: str, drop_cols: List[str]) -> Tuple[pd.DataFrame, pd.Series]:
     cols = [c for c in df.columns if c != target_col and c not in drop_cols]
     X = df[cols].copy()
     y = df[target_col].copy()
@@ -86,8 +94,15 @@ def type_columns(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
     return num_cols, cat_cols
 
 def make_pipeline(num_cols: List[str], cat_cols: List[str], model_name: str, params: Dict):
-    numeric = Pipeline(steps=[("scaler", StandardScaler())])
-    categorical = Pipeline(steps=[("onehot", OneHotEncoder(handle_unknown="ignore"))])
+    # Robust preprocessing: imputation + scaling/OHE
+    numeric = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+    categorical = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ])
     pre = ColumnTransformer(
         transformers=[
             ("num", numeric, num_cols),
@@ -95,10 +110,10 @@ def make_pipeline(num_cols: List[str], cat_cols: List[str], model_name: str, par
         ]
     )
     if model_name == "Logistic Regression":
-        clf = LogisticRegression(max_iter=params.get("max_iter", 200), C=params.get("C", 1.0), n_jobs=None, multi_class="auto")
+        clf = LogisticRegression(max_iter=params.get("max_iter", 300), C=params.get("C", 1.0))
     elif model_name == "Random Forest":
         clf = RandomForestClassifier(
-            n_estimators=params.get("n_estimators", 300),
+            n_estimators=params.get("n_estimators", 400),
             max_depth=params.get("max_depth", None),
             random_state=42
         )
@@ -168,17 +183,20 @@ def auto_build_single_input(df: pd.DataFrame, X_cols: List[str]) -> Dict[str, an
     return values
 
 # ---------------------- Sidebar / Navigation ----------------------
-st.sidebar.title("🧠 Alzheimer’s ML Dashboard")
-df = load_data()  # no uploader, fixed path only
+st.sidebar.title("🧠 OASIS – Alzheimer’s ML Dashboard")
+df = load_data()  # fixed path only
 
 st.sidebar.markdown(f"**Data path:** `{DEFAULT_PATH}`")
 
+# Lock to Group if present; allow override
 auto_label = pick_label_column(df)
 label_col = st.sidebar.selectbox("Target column", options=list(df.columns),
                                  index=list(df.columns).index(auto_label) if auto_label in df.columns else 0)
 st.sidebar.caption(f"Auto-detected: **{auto_label}**")
 
-drop_suggest = suggest_drop_cols(df)
+# Default OASIS drops: Subject ID, MRI ID (if present)
+default_drops = [c for c in ["Subject ID", "MRI ID"] if c in df.columns]
+drop_suggest = sorted(list(set(default_drops + suggest_drop_cols(df))))
 drop_cols = st.sidebar.multiselect("Columns to drop (IDs, nearly-unique)",
                                    options=list(df.columns),
                                    default=[c for c in drop_suggest if c != label_col])
@@ -286,9 +304,9 @@ elif page == "Train & Evaluate":
             params = {}
             if model_name == "Logistic Regression":
                 params["C"] = st.number_input("C (inverse regularization)", min_value=0.001, value=1.0, step=0.1)
-                params["max_iter"] = st.number_input("max_iter", min_value=50, value=200, step=50)
+                params["max_iter"] = st.number_input("max_iter", min_value=50, value=300, step=50)
             elif model_name == "Random Forest":
-                params["n_estimators"] = st.number_input("n_estimators", min_value=50, value=300, step=50)
+                params["n_estimators"] = st.number_input("n_estimators", min_value=50, value=400, step=50)
                 max_depth = st.text_input("max_depth (blank = None)", value="")
                 params["max_depth"] = None if max_depth.strip() == "" else int(max_depth)
             elif model_name == "Gradient Boosting":
@@ -309,7 +327,7 @@ elif page == "Train & Evaluate":
 
         st.markdown("#### Confusion Matrix")
         fig, ax = plt.subplots()
-        im = ax.imshow(cm, cmap="Blues")
+        ax.imshow(cm, cmap="Blues")
         ax.set_xticks(range(len(labels))); ax.set_yticks(range(len(labels)))
         ax.set_xticklabels(labels, rotation=45, ha="right"); ax.set_yticklabels(labels)
         for i in range(cm.shape[0]):
